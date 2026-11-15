@@ -1,0 +1,405 @@
+# dsh-mcp-control — 在设置里开关每个 MCP 服务器，并看清它每轮吃掉多少 token
+
+[English](README.en.md) | 中文
+
+> **这是 [`dsh-mcp-toggle`](https://www.npmjs.com/package/dsh-mcp-toggle) 的维护分支。**
+> 上游已长期停更（最后发布 1.0.1）。它提供了正确的骨架，但只做单个开关，
+> 且写入 `$DSH_HOME/cordis.patch.yml` 前**不留备份、无审批闸门**——
+> 改坏一次，所有 profile 都可能起不来。
+> 本分支保留骨架，补上三件上游缺的东西：**每个服务器的 token 成本可见**、
+> **写入前自动备份**、**可批量操作**。
+
+---
+
+## 它是什么
+
+DSH 的 MCP 服务器是**常驻成本**。服务器连接后，它每个工具的模式
+（名字 + 描述 + 参数）都会进入**每一轮**请求的稳定前缀。服务器越重，这一项越贵：
+
+| 服务器 | 工具数 | 模型可见的模式字节 | 折合每轮 |
+|---|---|---|---|
+| `rea`（本机实测） | 207 | 766,054 B | **~191K token** |
+
+这不是估算，是面板读 `ctx.tools.schemas()` 得到的实测值。
+在 320K token 的前缀里，它一个人占了六成——决定了一轮请求还能不能塞下别的。
+
+本插件给你一个面板，做六件事：
+
+1. **看见**：每个 MCP 服务器当前注册了多少工具、占多少字节、折合多少 token；
+2. **开关**：关掉即**真正注销**它的全部工具，省下**全额** token，而不是"隐藏"；
+3. **记住**：写入 `$DSH_HOME/cordis.patch.yml` 的覆盖行，重启后依然生效。
+4. **记账**：谁真的被调用了、多久、失败率多少 —— 见《调用记录》；
+5. **导入**：把别的 MCP 客户端里已经配好的服务器搬过来 —— 见《从别的客户端导入》；
+6. **安装**：从官方目录搜一个装进补丁文件 —— 见《目录搜索与安装》。
+
+第 4–6 项来自对 [`dsh-overall-mcp`](https://github.com/YunzhouLi-hub/dsh-overall-mcp)
+的借鉴。它走了一条我们不走的路（运行时 `ctx.plugin(mcpClient)` 动态挂载），
+所以**只有能抄的部分抄了**：见 `DECISION.md` 子决策 7。
+
+面板默认住在**设置 → MCP 控制台**，也可以搬到左侧边栏——见《面板入口》。
+
+## 面板入口
+
+同一个页面，两个座位：**设置里的一个页面**，或**左侧边栏的一行图标**。
+默认是设置页，因为升级不该把面板搬到没人要求搬的地方。
+
+要挪位置，去**设置 → 插件 → dsh-mcp-control**，"面板入口"卡片里随时可以改：
+
+| 选择 | 面板出现在 |
+|---|---|
+| 仅侧栏 | 左侧边栏一行图标（设置页那一节同时注销） |
+| 仅设置页 | 设置里的一个页面（侧栏那一行同时注销） |
+
+两个座位**任一时刻只保留一个**——注销当前座位前会先取消选中，
+不会留下一个点了没反应的图标。偏好存在 `$DSH_HOME/dsh-mcp-control/state.json`，
+**不写进** `cordis.patch.yml`：补丁表达的是"组成"，而这个值任何组成都不读，
+写进去只会让每次点击都唤醒 patch watcher 重放一遍组成。
+
+## 它不是什么
+
+- **不是**隐藏式省 token 的假开关。见《关掉是真省》。
+- **不是**连接器面板。`dsh-mcp-connector` 一类插件只枚举**它自己建的连接**；
+  本插件按 loader 条目枚举，**看得见每一层里的每一行 MCP**，不受来源限制。
+- **不是**"装完就归它管"的运行时挂载器。新增的服务器**一律写进补丁文件**，
+  所以 `git diff` 看得见、卸载时删得干净、重启后仍在。
+- **不需要**构建、**不需要**依赖。纯 JS：`index.js` + `client.js` + `lib/`。
+
+## 你需要它吗
+
+只有当你的 MCP 服务器**多到或重到值得开关**时才需要。判断方法：
+
+- 打开面板看一眼"每轮约"。**单一轻量服务器（几十个工具、几万字节）不必装**——
+  省下的 token 抵不上多一个插件的心智成本。
+- **重服务器才划算**（数百工具 / 数十万字节），典型是 REA 这类自描述极强的 MCP。
+- 如果你从不在多个项目间切换 MCP 组合，直接在 patch 里注释掉那一行更省事。
+
+## 关掉是真省 —— 机制与证据
+
+"禁用一个 MCP 条目"到底省不省 token，只有一个判据：**工具是否真的从注册表里消失**。
+
+这条链路已逐行核对 DSH 源码，并在本机实测：
+
+```
+loader: Entry#update({disabled:true})
+  → 该条目的 fiber 被 dispose
+    → @deepseek-ai/dsh-mcp-client 的 ctx.effect 清理函数运行
+      → 关闭 stdio 传输
+      → 并调用它为每个工具登记的那个 disposer
+        → ctx.tools.register 的登记被撤销
+```
+
+关键在于：`dsh-mcp-client` **没有惰性注册路径**。它只有一条路——
+`syncTools` → `listTools({cacheMode:"refresh"})` → 对每个工具 `ctx.tools.register`。
+所以"关掉"必然等于"注销"，不存在"关掉了但模式还留着"的中间态。
+
+实测（本机桌面 profile，服务器 `rea`）：
+
+| 步骤 | 结果 |
+|---|---|
+| 关闭前 | `enabled: true`，`fiberPhase: active`，`tools: 207`，`estTokens: 191514` |
+| 关闭后 | `enabled: false`，`fiberPhase: null`（fiber 已销毁），**`tools: 0`**，`estTokens: 0` |
+| 重开后 | `enabled: true`，`fiberPhase: active`，`tools: 207`，`estTokens: 191514` |
+
+`tools: 0` 是关键——它读的是 `ctx.tools.schemas()`，即**当前真正注册在案**的工具表。
+不是本插件自己记的账，是问的工具服务本身。
+
+> 因此：**本插件不实现"隐藏但不注销"模式**。那种模式省不了 token，
+> 却会让人以为省了——这是本仓库明确拒绝做的事（见 `DECISION.md`）。
+
+## 为什么写进 HOME 层
+
+DSH 的组合顺序是：
+
+```
+bundle  →  profile cordis.patch.yml  →  $DSH_HOME/cordis.patch.yml  →  overlays
+```
+
+**HOME 层压过 per-profile 层。** 而 MCP 行往往分散在两层里（例如 REA 装在 HOME）。
+若把覆盖行写进 profile，HOME 那行会把它盖掉，你会得到一个"改了但没生效"的面板。
+
+所以覆盖行写 **`$DSH_HOME/cordis.patch.yml`**（`DSH_HOME` 环境变量优先，
+否则 `~/.dsh/cordis.patch.yml`）。面板还会列出它检查过的**全部候选层**及各自是否存在。
+
+## 不修改你写的那一行 —— 只追加覆盖行
+
+面板**从不重写**它找到的 MCP 行。那一行通常在 `insert:` 列表里，是安装器写的。
+
+它做的是**追加一条独立覆盖行**：
+
+```yaml
+- insert:
+    - id: rea-mcp
+      name: "@deepseek-ai/dsh-mcp-client"
+      config:
+        serverName: rea
+        # ...
+
+- id: rea-mcp          # ← 只有这一行是本插件加的
+  disabled: true
+```
+
+这么写能成立，是因为 DSH 内置的补丁应用器 `applyEntryPatches` 有三条性质：
+
+1. 插入的条目**边插边建索引**，所以"后来的补丁"能命中"先前的插入"
+   → 覆盖行**必须在 insert 之后**；`upsertDisabled()` 保证这一点；
+2. 补丁**不写 `name` 就跳过名字校验** → 覆盖行只带 `id` + `disabled` 即可；
+3. 覆盖是**逐键应用**的 → `disabled` 碰不到 `config`，改不动你的服务器配置。
+
+三条都写进了 `test/patch-contract.test.mjs`——它把这套语义独立实现一遍，
+再断言本插件产出的 YAML 满足它。**该测试是金丝雀，不是历史遗留。**
+
+写入是**逐行**的：同一 id 永远只有一条顶层覆盖行；就地改写 `disabled:`；
+不重排、不整文件重写、不碰 `insert:` 里的行；保留 CRLF/LF 与结尾换行。
+**若目标状态与当前状态相同，则文件一个字节都不动。**
+
+## 调用记录
+
+面板第二页记的是**真正用过的东西**：哪些 MCP 工具被调用了、几次、多久、失败几次。
+
+数据来自宿主的 `session/event` 事件流，取 `tool/call` 与 `tool/result` 两种，
+按 `callId` 配对。只记 `mcp__<server>__<tool>` 与 `skill` 两类调用，
+`read` / `bash` 这些原生工具不记——否则日志会被日常操作淹没。
+
+| 字段 | 含义 |
+|---|---|
+| 今日 / 总数 | 按**本地时区**切日期，不是 UTC |
+| 成功率 | 只算**已结算**的调用；还在跑的不进分母 |
+| 平均耗时 | 同上；没结算的没有耗时可算 |
+| 保留 | 最近 7 天、最多 20000 行（`$DSH_HOME/dsh-mcp-control/calls.jsonl`） |
+
+一条记录**在结算时才写盘**。参考实现把"开始"也写进去、读的时候再合并，
+代价是进程在两次写之间被杀会留下永远「运行中」的孤儿行——面板上就会出现
+"有个调用转了一星期"。这里不这么做。
+
+## 从别的客户端导入
+
+别的 MCP 客户端里已经配好的服务器，可以一键搬进 DSH。扫描是**白名单制**：
+只读下面这十个路径，**绝不递归**。
+
+```
+%APPDATA%/Claude/claude_desktop_config.json   Claude Desktop
+~/.claude.json                                Claude Code
+~/.claude/settings.json                       Claude Code
+%APPDATA%/Code/User/mcp.json                  VS Code
+%APPDATA%/Code - Insiders/User/mcp.json       VS Code Insiders
+~/.cursor/mcp.json                            Cursor
+%APPDATA%/Windsurf/User/mcp_config.json       Windsurf
+~/.codeium/windsurf/mcp_config.json           Windsurf
+~/.gemini/settings.json                       Gemini CLI
+~/.codex/config.toml                          Codex CLI
+```
+
+认三种 JSON schema（`mcpServers` / `servers` / `mcp.servers`），
+外加 Codex 的 `[mcp_servers.<name>]` TOML 段（自带一个极简提取器，不引 TOML 库）。
+`sse` 传输**不可导入**——`dsh-mcp-client` 不支持它，面板会直接标出来而不是假装能装。
+
+## 目录搜索与安装
+
+搜的是 MCP 官方 registry（`registry.modelcontextprotocol.io`），因为另外两个源
+实测一个是 500、另一个只是 README 里的链接。
+
+打开「目录」就加载第一页，不用先想一个词——空关键词在官方 registry 上返回的就是
+第一页全部条目。registry 是「一条目一版本一行」，同一条目搜出来会有两三行，
+所以**按名字合并，只留最新版本**。「下一页」是**接着看**：新一页追加在后面，
+不换掉你已经看到的那批。
+
+安装 = 往 `$DSH_HOME/cordis.patch.yml` **追加一整块** `- insert:`。
+运行时不另存状态：写完文件就交给 DSH 的 HMR，它正监听着这个文件。
+
+| 动作 | 落到哪里 |
+|---|---|
+| 安装 | 补丁文件多一块 `- insert:`，运行树同步挂上 |
+| 卸载 | 只删本插件写的那一块；旁边宿主写的行一个字节不动 |
+| 回滚 | 每次写入前都有备份，`backupPath` 指回去 |
+
+装之前会**校验**：`serverName` 必须匹配 `/^[A-Za-z0-9_-]{1,32}$/`（`dsh-mcp-client`
+自己的规则），id 重复时**拒绝而不是覆盖**——覆盖会静默改掉一条正在运行的服务器。
+
+## 安全
+
+上游最大的短板是**改 patch 前不备份**。本分支补上了。
+
+- **写前备份**：每次写入前先把**原文件字节**存为
+  `cordis.patch.yml.backup-<ISO时间戳>-<两位序号>`（同目录），响应回传 `backupPath`。
+  序号不是装饰：时间戳只有毫秒精度，同毫秒内的第二次写入会**覆盖**第一份备份
+  （CI 在 Linux 上真的这样丢过 4 份）。序号保证每份都在。
+- **自动清理**：只保留最近 **10** 份，按文件名排序裁掉更旧的。
+- **备份失败不阻断**：备份是尽力而为。真失败了，开关照常生效，
+  响应报 `backupError`——**绝不假装备份成功**。
+- **先活后存**：先改运行时（立即生效），再落盘。落盘失败则响应 `persisted: false`
+  + `persistError`：运行时状态是真的，磁盘状态是假的，两者分开报。
+- **绝不跨越 API 抛错**：任何路径都返回 JSON。
+- **锁定条目**：`include`、`cordis:include`、`dsh-mcp-control`、`dsh-mcp-toggle` 一律 403。
+- **1 MB 请求体上限**。
+- **只动开关与自己装的行**：开关只碰 `disabled:`；安装/卸载只碰本插件追加的
+  `- insert:` 块与它对应的顶层覆盖行。别处写的服务器定义一个字节不动；不碰 `cordis.yml`。
+
+回滚：把 `backupPath` 指向的文件复制回 `cordis.patch.yml` 即可。
+
+## 安装
+
+```bash
+# 从 GitHub（推荐——名字带 owner，避免撞上同名仓库）
+dsh plugin --profile desktop add github:ZiYuan258/dsh-mcp-control
+
+# 或从本机目录（开发时用这个，改完重新 add 一次即可）
+dsh plugin --profile desktop add "<本目录绝对路径>"
+```
+
+- 插件行 id 是 **`mcp-control`**（不是包名——`cordis.patch.yml` 插入的是短 id）。
+- **客户端半是冷加载的**：装完、改了 `client.js` 之后要**硬刷新**页面。
+  宿主的 HMR 只跟踪**它自己**的 patch 文件，**不会**跟踪本插件目录里源码的改动；
+  改了 `index.js` / `client.js` 要重新 `add` 一次才会投影到 profile。
+- 宿主路由：`GET|POST http://127.0.0.1:<端口>/mcp-control/api`。
+
+## 测试
+
+```bash
+npm test
+```
+
+```
+test/unit.test.mjs                 纯函数（upsertDisabled 全部分支、CRLF、引号 id）
+test/patch-contract.test.mjs       产出的 YAML 必须满足 DSH 真实补丁语义（金丝雀）
+test/patch.test.mjs                安装/卸载的行编辑：引号、缩进、三层删除守卫
+test/calls.test.mjs                调用记录：分类、配对、口径（今日/成功率/平均）
+test/scan.test.mjs                 扫描导入：三种 schema、TOML、白名单隐私边界
+test/catalog.test.mjs              目录搜索：分发包选择、spec 生成、id 归一
+test/write-path.test.mjs           写路径契约：备份、幂等、失败不假装成功
+test/package-contract.test.mjs     版本一致性、files 白名单、无 @deepseek-ai 运行时依赖
+test/docs-parity.test.mjs          中英 README 章节对齐、发布说明双语结构
+test/release-consistency.test.mjs  每个版本都有发布说明
+test/panel-entry.test.mjs          面板入口：座位词汇、状态文件往返、槽位注册/注销、谁负责滚
+test/servers-view.test.mjs        服务器视图：未挂载行、单服务器调用计数
+test/catalog-view.test.mjs        目录视图：打开即加载、翻页追加、搜索替换
+```
+
+零依赖，用 Node 内置 `node:test`。
+
+## HTTP API
+
+`GET /mcp-control/api` → 快照：
+
+```json
+{
+  "ok": true,
+  "servers": [{
+    "entryId": "include:rea-mcp",
+    "rawId": "rea-mcp",
+    "serverName": "rea",
+    "enabled": true,
+    "fiberPhase": "active",
+    "toolCount": 207,
+    "schemaBytes": 766054,
+    "estTokens": 191514,
+    "breakdown": { "nameBytes": 6148, "descriptionBytes": 92265, "parameterBytes": 667641 },
+    "layer": "home",
+    "inFile": true,
+    "calls": { "calls": 42, "failed": 1, "avgMs": 310 }
+  }],
+  "orphaned": [],
+  "totals": { "servers": 1, "enabled": 1, "disabled": 0, "mcpToolCount": 207,
+              "mcpSchemaBytes": 766054, "mcpEstTokens": 191514,
+              "activeEstTokens": 191514, "bytesPerToken": 4,
+              "calls": 42, "callsToday": 5, "okRate": 97.6 },
+  "patchPath": "C:\\Users\\<you>\\.dsh\\cordis.patch.yml",
+  "layersReadable": true,
+  "panelEntry": "settings",
+  "panelEntryFile": "<DSH_HOME>/dsh-mcp-control/state.json",
+  "callsPath": "<DSH_HOME>/dsh-mcp-control/calls.jsonl"
+}
+```
+
+（`panelEntryError` 只在状态文件存在但读不出来时出现。）
+（`orphaned` 是补丁文件里有、运行树里却没跑起来的行。）
+
+加 `?view=` 可以要另外三个视图：
+
+| view | 返回 |
+|---|---|
+| （默认） | 服务器快照：每行成本、调用数、是否还在补丁文件里 |
+| `calls` | 最近 200 条调用记录 + 统计 + 日志文件路径 |
+| `scan` | 白名单十个配置文件的扫描结果，每条带可直接安装的 `suggested` |
+| `catalog&q=&cursor=` | 官方目录搜索结果，每条带 `suggested` |
+
+`POST /mcp-control/api`，六选一：
+
+```json
+{ "entryId": "include:rea-mcp", "disabled": true }
+{ "action": "disable-all" }
+{ "action": "set-panel-entry", "entry": "sidebar" }
+{ "action": "install-server", "spec": { "id": "mcp-fetch", "serverName": "fetch", "transport": "stdio", "command": "uvx", "args": ["mcp-server-fetch"] } }
+{ "action": "remove-server", "rawId": "mcp-fetch" }
+{ "action": "clear-calls" }
+```
+
+单条响应：`{ ok, entryId, rawId, serverName, disabled, fiberPhase, persisted,
+persistMode, patchPath, backupPath?, persistError? }`
+
+面板入口响应：`{ ok, action: "set-panel-entry", panelEntry, panelEntryFile }`。
+`entry` 不是 `sidebar` / `settings` 之一时返回 **400**——拒绝而不是替换成合法值；
+写入失败返回 **500**，状态文件保持原样。
+
+安装响应：`{ ok, action: "install-server", id, serverName, patchPath, backupPath? }`。
+**不调用 loader**——补丁文件写完就交给 DSH 的 HMR。id 已存在返回 **409**，
+spec 不合法返回 **400**。卸载响应：
+`{ ok, action: "remove-server", rawId, removed, patchPath, backupPath? }`；
+找不到返回 **404**，锁定条目返回 **403**。
+
+| 状态码 | 含义 |
+|---|---|
+| 400 | 请求体非法 / `disabled` 不是布尔 / 目标不是 MCP 行 / spec 不合法 |
+| 403 | `entryId` 为空 / 条目被锁定 |
+| 404 | 未知条目 / 要卸载的 id 不在补丁里 |
+| 405 | 方法不支持 |
+| 409 | 安装的 id 已存在（拒绝覆盖正在运行的服务器） |
+| 500 | loader 抛错 / 写盘失败 |
+| 502 | 目录服务不可达 |
+| 503 | loader 服务不可用 |
+
+## 两个诚实的说明
+
+**一、`estTokens` 是除法，不是分词器。** 它等于 `bytes / 4`。
+中英混排、JSON 结构、重复字段都会让它偏离真实值，通常 ±15%。
+它的用途是**排序和量级判断**——"这个服务器值不值得常驻"——
+而不是"这一轮精确花了多少 token"。绝对值以账单为准。
+
+**二、统计的是模型可见投影，不是 MCP 原始载荷。**
+本插件只计 `name` + `description` + `JSON.stringify(parameters)`。
+MCP 工具若声明了 `outputSchema`，**它不进模型上下文**（DSH 只转发 `parameters`），
+所以本插件**不计**它。这正是 REA 原始载荷 3.0 MB 里约 73% 被排除的原因——
+面板的 785 KB 是**真实进入上下文**的那部分，比原始 `tools/list` 小得多，
+也比它诚实得多。
+
+## 目录
+
+```
+index.js          宿主半：路由 + 枚举 + 成本统计 + 落盘（逐行 upsert + 备份）
+client.js         浏览器半：四个视图（手写 ModuleLoader CJS 闭包，无构建步骤）
+lib/patch.js      安装/卸载：补丁行的校验、生成、精确删除
+lib/calls.js      调用记录：分类、配对、口径、裁剪
+lib/scan.js       扫描导入：白名单十个路径、三种 JSON schema、极简 TOML
+lib/catalog.js    官方目录搜索：分发包选择、spec 生成
+cordis.patch.yml  插入插件行 mcp-control
+locale/           en.json / zh.json —— 插件列表里的标题与描述
+icon.svg          插件图标
+AGENTS.md         维护契约（改这个仓库之前先读）
+DECISION.md       为什么 fork、为什么写覆盖行、为什么拒绝"假省"模式
+SECURITY.md       安全模型与威胁边界（英文）
+SECURITY.zh.md    同上，中文
+docs/             发布说明
+test/            零依赖测试（node:test）
+```
+
+## 许可与署名
+
+MIT，见 `LICENSE`。
+
+骨架来自 **`dsh-mcp-toggle`**，Copyright (c) 2026 **Zenjibad**（MIT）。
+条目枚举、按 `entry.options.name` 识别 MCP 行、`settings.section` 注册方式，
+以及"用 `Entry#update` 而**不是** `EntryTree.update`"这个关键判断，都源自上游。
+其中最后一条尤其重要：`EntryTree.update` 会调用 `tree.write()`，把补丁**摊平**进
+`cordis.yml`，摧毁补丁层的意义——上游踩过这个坑，本分支沿用了它的结论。
+
+本分支的增量：成本可见性、写前备份、批量操作、幂等写路径、双语界面，
+以及一套把 DSH 补丁语义钉死的测试。
